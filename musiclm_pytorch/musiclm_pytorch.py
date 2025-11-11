@@ -1,5 +1,6 @@
 import math
 from functools import wraps, partial
+import numpy as np
 
 import torch
 import torch.nn.functional as F
@@ -371,17 +372,19 @@ class AudioSpectrogramTransformer(nn.Module):
         ff_dropout = 0.,
         accept_spec = False,
         accept_spec_time_first = True,
-        spec_n_fft = 128,
+        spec_n_fft = 2048,  # Optimized for better frequency resolution
         spec_power = 2,
-        spec_win_length = 24,
-        spec_hop_length = None,
+        spec_win_length = 512,  # Optimized window length
+        spec_hop_length = None,  # Will be calculated as win_length // 4
         spec_pad = 0,
         spec_center = True,
         spec_pad_mode = 'reflect',
         spec_aug_stretch_factor = 0.8,
-        spec_aug_freq_mask = 80,
-        spec_aug_time_mask = 80,
-        patch_dropout_prob = 0.25
+        spec_aug_freq_mask = 27,  # Optimized frequency masking
+        spec_aug_time_mask = 100,  # Optimized time masking
+        patch_dropout_prob = 0.25,
+        support_variable_length = True,  # New parameter for variable length support
+        max_audio_length = 1024 * 320  # Maximum audio length in samples (about 20 seconds at 16kHz)
     ):
         super().__init__()
         self.dim = dim
@@ -399,12 +402,20 @@ class AudioSpectrogramTransformer(nn.Module):
 
         self.accept_spec = accept_spec
         self.accept_spec_time_first = accept_spec_time_first
+        self.support_variable_length = support_variable_length
+        self.max_audio_length = max_audio_length
+        
+        # Calculate hop_length if not provided for optimal overlap
+        if spec_hop_length is None:
+            spec_hop_length = spec_win_length // 4
+            
+        self.spec_hop_length = spec_hop_length
 
         self.spec = Spectrogram(
             n_fft = spec_n_fft,
             power = spec_power,
             win_length = spec_win_length,
-            hop_length = spec_hop_length,
+            hop_length = self.spec_hop_length,
             pad = spec_pad,
             center = spec_center,
             pad_mode = spec_pad_mode
@@ -451,10 +462,29 @@ class AudioSpectrogramTransformer(nn.Module):
         self,
         x,
         force_no_patch_dropout = False,
-        return_all_layers = False
+        return_all_layers = False,
+        audio_lengths = None  # New parameter for variable length audio support
     ):
         batch, device = x.shape[0], x.device
         assert (self.accept_spec and x.ndim == 3) or (not self.accept_spec and x.ndim == 2)
+
+        # Handle variable length audio with masking
+        if self.support_variable_length and audio_lengths is not None:
+            # Create attention mask for variable length sequences
+            if not self.accept_spec:
+                # Calculate expected spectrogram dimensions
+                hop_length = self.spec_hop_length
+                n_fft = self.spec.n_fft
+                expected_time_frames = (audio_lengths + hop_length - 1) // hop_length
+                max_time_frames = (self.max_audio_length + hop_length - 1) // hop_length
+                
+                # Create padding mask
+                mask = torch.arange(max_time_frames, device=device).unsqueeze(0) < expected_time_frames.unsqueeze(1)
+            else:
+                # For pre-computed spectrograms, use the provided lengths directly
+                mask = audio_lengths
+        else:
+            mask = None
 
         if self.accept_spec and self.accept_spec_time_first:
             x = rearrange(x, 'b t f -> b f t')
@@ -522,7 +552,7 @@ class AudioSpectrogramTransformer(nn.Module):
 
         # attention, what else
 
-        x, all_layers = self.transformer(x, rel_pos_bias = rel_pos_bias, return_all_layers = True)
+        x, all_layers = self.transformer(x, rel_pos_bias = rel_pos_bias, mask = mask, return_all_layers = True)
 
         # final global average and norm (most recent papers show this is superior to CLS token)
 
@@ -934,3 +964,362 @@ class MusicLM(nn.Module):
         top_matching_index = sims.topk(1, dim = 0).indices.item()
 
         return samples[top_matching_index]
+
+
+# OpenCLIP Integration
+# MuLaN adapter for open_clip compatibility
+
+class MuLaNOpenCLIPAdapter(nn.Module):
+    """
+    Adapter to use MuLaN with OpenCLIP framework.
+    This allows MuLaN to be used as an audio-text contrastive model
+    within the OpenCLIP ecosystem.
+    """
+    
+    def __init__(
+        self,
+        mulan: MuLaN,
+        audio_input_dim: int = 1024,
+        text_input_dim: int = 512,
+        embed_dim: int = 512,
+        audio_patch_size: int = 16,
+        text_patch_size: int = 1
+    ):
+        super().__init__()
+        self.mulan = mulan
+        self.embed_dim = embed_dim
+        
+        # Projection layers to match OpenCLIP dimensions
+        self.audio_projection = nn.Linear(mulan.audio.dim, embed_dim)
+        self.text_projection = nn.Linear(mulan.text.dim, embed_dim)
+        
+        # Store patch sizes for OpenCLIP compatibility
+        self.audio_patch_size = audio_patch_size
+        self.text_patch_size = text_patch_size
+        
+        # Vision model-like interface for OpenCLIP
+        self.visual = mulan.audio  # Audio acts as "visual" modality
+        self.text_encoder = mulan.text
+        
+        # Logit scale for contrastive learning (OpenCLIP style)
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        
+    def encode_audio(self, audio, audio_lengths=None, normalize=True):
+        """Encode audio using MuLaN audio transformer."""
+        # Get audio embeddings from MuLaN
+        if audio_lengths is not None:
+            audio_features = self.mulan.audio(audio, audio_lengths=audio_lengths)
+        else:
+            audio_features = self.mulan.audio(audio)
+            
+        # Project to OpenCLIP embedding space
+        audio_embeddings = self.audio_projection(audio_features)
+        
+        if normalize:
+            audio_embeddings = F.normalize(audio_embeddings, dim=-1)
+            
+        return audio_embeddings
+    
+    def encode_text(self, text, normalize=True):
+        """Encode text using MuLaN text transformer."""
+        # Get text embeddings from MuLaN
+        text_features = self.mulan.text(text)
+        
+        # Project to OpenCLIP embedding space
+        text_embeddings = self.text_projection(text_features)
+        
+        if normalize:
+            text_embeddings = F.normalize(text_embeddings, dim=-1)
+            
+        return text_embeddings
+    
+    def forward(self, audio, text, audio_lengths=None):
+        """
+        Forward pass for contrastive learning.
+        Returns audio and text embeddings for contrastive loss computation.
+        """
+        audio_embeddings = self.encode_audio(audio, audio_lengths)
+        text_embeddings = self.encode_text(text)
+        
+        # Get logit scale
+        logit_scale = self.logit_scale.exp()
+        
+        return audio_embeddings, text_embeddings, logit_scale
+    
+    def get_similarity(self, audio, text, audio_lengths=None):
+        """Get similarity scores between audio and text pairs."""
+        audio_embeddings, text_embeddings, logit_scale = self.forward(audio, text, audio_lengths)
+        
+        # Compute similarity matrix
+        logits_per_audio = logit_scale * audio_embeddings @ text_embeddings.t()
+        logits_per_text = logit_scale * text_embeddings @ audio_embeddings.t()
+        
+        return logits_per_audio, logits_per_text
+
+
+def create_mulan_open_clip_model(
+    dim=512,
+    depth=6,
+    heads=8,
+    dim_head=64,
+    embed_dim=512,
+    audio_sample_rate=16000,
+    use_case='music',
+    spec_n_fft=None,  # Will be set by get_optimal_spectrogram_params
+    spec_win_length=None,  # Will be set by get_optimal_spectrogram_params
+    spec_hop_length=None,  # Will be set by get_optimal_spectrogram_params
+    decoupled_contrastive_learning=True,
+    sigmoid_contrastive_loss=False
+):
+    """
+    Factory function to create a MuLaN model adapted for OpenCLIP.
+    
+    Args:
+        dim: Model dimension
+        depth: Transformer depth
+        heads: Number of attention heads
+        dim_head: Dimension per head
+        embed_dim: Embedding dimension for OpenCLIP compatibility
+        audio_sample_rate: Audio sample rate
+        use_case: One of 'music', 'speech', 'general'
+        spec_n_fft: FFT size for spectrogram (if None, uses optimal params)
+        spec_win_length: Window length for spectrogram (if None, uses optimal params)
+        spec_hop_length: Hop length for spectrogram (if None, uses optimal params)
+        decoupled_contrastive_learning: Use decoupled contrastive learning
+        sigmoid_contrastive_loss: Use sigmoid contrastive loss
+    
+    Returns:
+        MuLaNOpenCLIPAdapter instance ready for OpenCLIP training
+    """
+    
+    # Get optimal spectrogram parameters if not specified
+    if spec_n_fft is None or spec_win_length is None:
+        spec_params = get_optimal_spectrogram_params(audio_sample_rate, use_case)
+        spec_n_fft = spec_n_fft or spec_params['spec_n_fft']
+        spec_win_length = spec_win_length or spec_params['spec_win_length']
+        spec_hop_length = spec_hop_length or spec_params.get('spec_hop_length')
+    
+    # Create audio transformer with optimized parameters
+    audio_transformer = AudioSpectrogramTransformer(
+        dim=dim,
+        depth=depth,
+        patch_size=16,
+        dim_head=dim_head,
+        heads=heads,
+        spec_n_fft=spec_n_fft,
+        spec_win_length=spec_win_length,
+        spec_hop_length=spec_hop_length,
+        spec_aug_freq_mask=27,  # Optimized for music
+        spec_aug_time_mask=100,
+        support_variable_length=True,
+        max_audio_length=audio_sample_rate * 20  # 20 seconds max
+    )
+    
+    # Create text transformer
+    text_transformer = TextTransformer(
+        dim=dim,
+        depth=depth,
+        heads=heads,
+        dim_head=dim_head
+    )
+    
+    # Create MuLaN model
+    mulan = MuLaN(
+        audio_transformer=audio_transformer,
+        text_transformer=text_transformer,
+        dim_latent=embed_dim,
+        decoupled_contrastive_learning=decoupled_contrastive_learning,
+        sigmoid_contrastive_loss=sigmoid_contrastive_loss
+    )
+    
+    # Wrap in OpenCLIP adapter
+    return MuLaNOpenCLIPAdapter(
+        mulan=mulan,
+        audio_input_dim=dim,
+        text_input_dim=dim,
+        embed_dim=embed_dim
+    )
+    """
+    Factory function to create a MuLaN model adapted for OpenCLIP.
+    
+    Args:
+        dim: Model dimension
+        depth: Transformer depth
+        heads: Number of attention heads
+        dim_head: Dimension per head
+        embed_dim: Embedding dimension for OpenCLIP compatibility
+        audio_sample_rate: Audio sample rate
+        spec_n_fft: FFT size for spectrogram
+        spec_win_length: Window length for spectrogram
+        spec_hop_length: Hop length for spectrogram
+        decoupled_contrastive_learning: Use decoupled contrastive learning
+        sigmoid_contrastive_loss: Use sigmoid contrastive loss
+    
+    Returns:
+        MuLaNOpenCLIPAdapter instance ready for OpenCLIP training
+    """
+    
+    # Create audio transformer with optimized parameters
+    audio_transformer = AudioSpectrogramTransformer(
+        dim=dim,
+        depth=depth,
+        patch_size=16,
+        dim_head=dim_head,
+        heads=heads,
+        spec_n_fft=spec_n_fft,
+        spec_win_length=spec_win_length,
+        spec_hop_length=spec_hop_length,
+        spec_aug_freq_mask=27,  # Optimized for music
+        spec_aug_time_mask=100,
+        support_variable_length=True,
+        max_audio_length=audio_sample_rate * 20  # 20 seconds max
+    )
+    
+    # Create text transformer
+    text_transformer = TextTransformer(
+        dim=dim,
+        depth=depth,
+        heads=heads,
+        dim_head=dim_head
+    )
+    
+    # Create MuLaN model
+    mulan = MuLaN(
+        audio_transformer=audio_transformer,
+        text_transformer=text_transformer,
+        dim_latent=embed_dim,
+        decoupled_contrastive_learning=decoupled_contrastive_learning,
+        sigmoid_contrastive_loss=sigmoid_contrastive_loss
+    )
+    
+    # Wrap in OpenCLIP adapter
+    return MuLaNOpenCLIPAdapter(
+        mulan=mulan,
+        audio_input_dim=dim,
+        text_input_dim=dim,
+        embed_dim=embed_dim
+    )
+
+
+def get_optimal_spectrogram_params(audio_sample_rate=16000, use_case='music'):
+    """
+    Get optimal spectrogram parameters for different use cases.
+    
+    Args:
+        audio_sample_rate: Audio sample rate in Hz
+        use_case: One of 'music', 'speech', 'general'
+    
+    Returns:
+        dict: Optimal spectrogram parameters
+    """
+    
+    # Base parameters optimized for 16kHz audio
+    base_params = {
+        'spec_n_fft': 2048,  # Provides good frequency resolution (~7.8 Hz per bin)
+        'spec_win_length': 512,  # 32ms window at 16kHz
+        'spec_power': 2,  # Power spectrogram
+        'spec_center': True,
+        'spec_pad_mode': 'reflect',
+        'spec_aug_freq_mask': 27,  # Frequency masking parameter
+        'spec_aug_time_mask': 100,  # Time masking parameter
+        'spec_aug_stretch_factor': 0.8,  # Time stretching factor
+    }
+    
+    # Adjust parameters based on use case
+    if use_case == 'music':
+        # Optimized for music generation
+        music_params = {
+            'spec_n_fft': 2048,  # High frequency resolution for music
+            'spec_win_length': 512,  # Balance between time and frequency resolution
+            'spec_hop_length': 128,  # 75% overlap for smooth spectrograms
+            'spec_aug_freq_mask': 27,  # Moderate frequency masking for music
+            'spec_aug_time_mask': 100,  # Moderate time masking
+            'patch_size': 16,  # Standard patch size for music
+        }
+        base_params.update(music_params)
+        
+    elif use_case == 'speech':
+        # Optimized for speech processing
+        speech_params = {
+            'spec_n_fft': 1024,  # Lower frequency resolution for speech
+            'spec_win_length': 400,  # 25ms window (standard for speech)
+            'spec_hop_length': 160,  # 10ms hop (standard for speech)
+            'spec_aug_freq_mask': 15,  # Less frequency masking for speech
+            'spec_aug_time_mask': 50,  # Less time masking for speech
+            'patch_size': 8,  # Smaller patches for speech details
+        }
+        base_params.update(speech_params)
+        
+    elif use_case == 'general':
+        # Balanced parameters for general audio
+        general_params = {
+            'spec_n_fft': 1536,  # Balanced frequency resolution
+            'spec_win_length': 480,  # ~30ms window
+            'spec_hop_length': 160,  # ~10ms hop
+            'spec_aug_freq_mask': 20,  # Balanced frequency masking
+            'spec_aug_time_mask': 75,  # Balanced time masking
+            'patch_size': 12,  # Medium patch size
+        }
+        base_params.update(general_params)
+    
+    # Adjust parameters based on sample rate
+    if audio_sample_rate != 16000:
+        # Scale window and hop lengths proportionally
+        scale_factor = audio_sample_rate / 16000
+        base_params['spec_win_length'] = int(base_params['spec_win_length'] * scale_factor)
+        if 'spec_hop_length' in base_params:
+            base_params['spec_hop_length'] = int(base_params['spec_hop_length'] * scale_factor)
+    
+    # Calculate hop length if not specified
+    if 'spec_hop_length' not in base_params:
+        base_params['spec_hop_length'] = base_params['spec_win_length'] // 4
+    
+    return base_params
+
+
+def create_optimized_audiospectrogram_transformer(
+    dim=512,
+    depth=6,
+    heads=8,
+    dim_head=64,
+    use_case='music',
+    audio_sample_rate=16000,
+    support_variable_length=True,
+    **kwargs
+):
+    """
+    Create an AudioSpectrogramTransformer with optimized parameters for specific use cases.
+    
+    Args:
+        dim: Model dimension
+        depth: Transformer depth
+        heads: Number of attention heads
+        dim_head: Dimension per head
+        use_case: One of 'music', 'speech', 'general'
+        audio_sample_rate: Audio sample rate
+        support_variable_length: Whether to support variable length audio
+        **kwargs: Additional arguments
+    
+    Returns:
+        AudioSpectrogramTransformer with optimized parameters
+    """
+    
+    # Get optimal spectrogram parameters
+    spec_params = get_optimal_spectrogram_params(audio_sample_rate, use_case)
+    
+    # Create the transformer with optimized parameters
+    return AudioSpectrogramTransformer(
+        dim=dim,
+        depth=depth,
+        heads=heads,
+        dim_head=dim_head,
+        spec_n_fft=spec_params['spec_n_fft'],
+        spec_win_length=spec_params['spec_win_length'],
+        spec_hop_length=spec_params['spec_hop_length'],
+        spec_aug_freq_mask=spec_params['spec_aug_freq_mask'],
+        spec_aug_time_mask=spec_params['spec_aug_time_mask'],
+        spec_aug_stretch_factor=spec_params['spec_aug_stretch_factor'],
+        support_variable_length=support_variable_length,
+        max_audio_length=audio_sample_rate * 20,  # 20 seconds max
+        **kwargs
+    )

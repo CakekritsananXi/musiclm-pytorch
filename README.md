@@ -136,6 +136,74 @@ musiclm = MusicLM(
 music = musiclm('the crystalline sounds of the piano in a ballroom', num_samples = 4) # sample 4 and pick the top match with mulan
 ```
 
+## Advanced Features
+
+### Variable Length Audio Support
+
+The AudioSpectrogramTransformer now supports variable length audio with automatic masking:
+
+```python
+from musiclm_pytorch import AudioSpectrogramTransformer
+
+# Create transformer with variable length support
+audio_transformer = AudioSpectrogramTransformer(
+    dim = 512,
+    depth = 6,
+    heads = 8,
+    support_variable_length = True,
+    max_audio_length = 16000 * 30  # 30 seconds at 16kHz
+)
+
+# Use with different length audio
+wavs = torch.randn(2, 12000)  # Different lengths
+audio_lengths = torch.tensor([12000, 8000])  # Actual lengths
+
+embeddings = audio_transformer(wavs, audio_lengths=audio_lengths)
+```
+
+### OpenCLIP Integration
+
+MuLaN can now be used with OpenCLIP for audio-text contrastive learning:
+
+```python
+from musiclm_pytorch import create_mulan_open_clip_model
+
+# Create MuLaN model optimized for OpenCLIP
+mulan_openclip = create_mulan_open_clip_model(
+    dim = 512,
+    depth = 6,
+    heads = 8,
+    use_case = 'music',  # 'music', 'speech', or 'general'
+    audio_sample_rate = 16000
+)
+
+# Encode audio and text
+audio_embeddings = mulan_openclip.encode_audio(wavs, audio_lengths)
+text_embeddings = mulan_openclip.encode_text(texts)
+
+# Get similarity scores
+logits_per_audio, logits_per_text = mulan_openclip.get_similarity(wavs, texts, audio_lengths)
+```
+
+### Optimized Spectrogram Parameters
+
+Get optimal spectrogram parameters for different use cases:
+
+```python
+from musiclm_pytorch import get_optimal_spectrogram_params, create_optimized_audiospectrogram_transformer
+
+# Get optimal parameters for music
+params = get_optimal_spectrogram_params(audio_sample_rate=16000, use_case='music')
+
+# Create optimized transformer
+transformer = create_optimized_audiospectrogram_transformer(
+    dim = 512,
+    depth = 6,
+    use_case = 'music',
+    audio_sample_rate = 16000
+)
+```
+
 ## Todo
 
 - [x] mulan seems to be using decoupled contrastive learning, offer that as an option
@@ -145,9 +213,9 @@ music = musiclm('the crystalline sounds of the piano in a ballroom', num_samples
 - [x] give dynamic positional bias to self attention in AST
 - [x] implement MusicLM generating multiple samples and selecting top match with MuLaN
 
-- [ ] support variable lengthed audio with masking in audio transformer
-- [ ] add a version of mulan to <a href="https://github.com/mlfoundations/open_clip">open clip</a>
-- [ ] set all the proper spectrogram hyperparameters
+- [x] support variable lengthed audio with masking in audio transformer
+- [x] add a version of mulan to <a href="https://github.com/mlfoundations/open_clip">open clip</a>
+- [x] set all the proper spectrogram hyperparameters
 
 ## Citations
 
